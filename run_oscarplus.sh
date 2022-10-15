@@ -1,0 +1,21 @@
+python oscar/run_retrieval.py \
+    --model_name_or_path /home/ubuntu/checkpoints/Oscar/checkpoint-1340000 \
+    --data_dir /home/ubuntu/data/coco_ir \
+    --img_feat_file /home/ubuntu/data/vinvl_coco14_train_val/model_0060000/features.tsv \
+    --do_train \
+    --do_lower_case \
+    --evaluate_during_training \
+    --num_captions_per_img_val 20 \
+    --eval_caption_index_file minival_caption_indexs_top20.pt \
+    --per_gpu_train_batch_size 16 \
+    --learning_rate 0.00002 \
+    --num_train_epochs 30 \
+    --weight_decay 0.05 \
+    --save_steps 5000 \
+    --add_od_labels \
+    --od_label_type vg \
+    --max_seq_length 70 \
+    --max_img_seq_length 70 \
+    --output_dir output/IAIS_COCO/ \
+    --loss_type iais
+    

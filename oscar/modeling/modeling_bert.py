@@ -68,6 +68,32 @@ class CaptionBertSelfAttention(BertSelfAttention):
 
         outputs = (context_layer, attention_probs) if self.output_attentions else (context_layer,)
         return outputs
+    
+    def get_attention_probs(self, hidden_states, attention_mask, attention_dir='raw'):
+        '''
+        hidden_states: [sample_num, max_tl+max_nbb, hidden_size(768)]
+        attention_mask: [sample_num, 1, max_tl+max_nbb, max_tl+max_nbb]
+        '''
+        mixed_query_layer = self.query(hidden_states)
+        mixed_key_layer = self.key(hidden_states)
+
+        query_layer = self.transpose_for_scores(mixed_query_layer)  # [sample_num, attn_head_num, max_tl+max_nbb, attn_head_size]
+        key_layer = self.transpose_for_scores(mixed_key_layer)
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))  # [sample_num, attn_head_num, max_tl+max_nbb, max_tl+max_nbb]
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+        attention_mask = (1.0 - attention_mask) * -10000.0
+        attention_scores = attention_scores + attention_mask
+        # Normalize the attention scores to probabilities.
+        if attention_dir == 'raw':
+            attention_probs = nn.Softmax(dim=-1)(attention_scores)
+        elif attention_dir == 'col':
+            attention_probs = nn.Softmax(dim=-2)(attention_scores)
+        else:
+            raise ValueError('attention direction must be raw or col')
+        return attention_probs
 
 
 class CaptionBertAttention(BertAttention):
@@ -96,9 +122,74 @@ class CaptionBertEncoder(BertEncoder):
         self.output_attentions = config.output_attentions
         self.output_hidden_states = config.output_hidden_states
         self.layer = nn.ModuleList([CaptionBertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.KLDivLoss = nn.KLDivLoss(reduction='batchmean')
+    
+    def get_txt_img_attn_masks(self, input_ids, num_bbs): # not used
+        txt_attn_masks_full = [torch.ones(len(input_ids[0]), dtype=torch.long) for _ in range(len(input_ids))]
+        txt_attn_masks = torch.ones(len(input_ids[0]), dtype=torch.long)
+        txt_attn_masks[0] = 0  # mask [CLS]
+        txt_attn_masks[-1] = 0  # mask [SEP]
+        txt_attn_masks = [txt_attn_masks for _ in range(len(input_ids))]
+        img_attn_masks = [torch.ones(num_bb, dtype=torch.long) for num_bb in num_bbs]
+        txt_attn_masks_full = pad_sequence(txt_attn_masks_full, batch_first=True,
+                                            padding_value=0)  # [sample_num, max_tl]
+        txt_attn_masks_tmp = pad_sequence(txt_attn_masks, batch_first=True, padding_value=0)  # [sample_num, max_tl]
+        img_attn_masks_tmp = pad_sequence(img_attn_masks, batch_first=True,
+                                            padding_value=0)  # [sample_num, max_nbb]
+        # all the masks below is [sample_num, max_tl+max_nbb]
+        attn_masks = torch.cat([txt_attn_masks_full, img_attn_masks_tmp], dim=1)
+        txt_attn_masks = torch.cat([txt_attn_masks_tmp, torch.zeros_like(img_attn_masks_tmp)], dim=1)
+        img_attn_masks = torch.cat([torch.zeros_like(txt_attn_masks_tmp), img_attn_masks_tmp], dim=1)
+        return txt_attn_masks, img_attn_masks, attn_masks
+
+    
+    def extend_self_attn_mask(self, attention_mask):
+        '''note this attention is 0-1'''
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        attention_mask = attention_mask.to(dtype=next(self.parameters()).dtype)
+        attention_mask = torch.matmul(attention_mask.permute(0, 1, 3, 2), attention_mask)
+        return attention_mask
+
+    def extend_cross_attn_mask(self, txt_attn_mask, img_attn_mask):
+        txt_attn_mask = txt_attn_mask.unsqueeze(1).unsqueeze(2)
+        txt_attn_mask = txt_attn_mask.to(dtype=next(self.parameters()).dtype)
+        img_attn_mask = img_attn_mask.unsqueeze(1).unsqueeze(2)
+        img_attn_mask = img_attn_mask.to(dtype=next(self.parameters()).dtype)
+        t2i_attn_mask = torch.matmul(txt_attn_mask.permute(0, 1, 3, 2), img_attn_mask)
+        i2t_attn_mask = torch.matmul(img_attn_mask.permute(0, 1, 3, 2), txt_attn_mask)
+        return t2i_attn_mask, i2t_attn_mask
+    
+    def get_attention_probs(self, layer_module, hidden_states, attn_mask, row_b, row_l, col_b=None, col_l=None):
+        attn = layer_module.attention.self.get_attention_probs(hidden_states,
+                                                               attn_mask)  # [sample_num, attn_head_num, ?, ?]
+        attn = torch.mul(attn, attn_mask)
+        attn = torch.narrow(attn, 2, row_b, row_l)
+        if col_b is None and col_l is None:
+            col_b, col_l = row_b, row_l
+        attn = torch.narrow(attn, 3, col_b, col_l)
+        attn = torch.mean(attn, dim=1)
+        return attn
+    
+    def iais_singular(self, txt_attn, img_attn, cross_attn, length, modal):
+        index = cross_attn.argmax(-1).detach().cpu().numpy().tolist()
+        rows = [[i] * length for i in index]
+        cols = [index] * length
+
+        if modal == 'L':
+            pseudo_txt_attn = nn.Softmax(dim=-1)(img_attn[rows, cols])
+            iais_loss = self.KLDivLoss(txt_attn.log(), pseudo_txt_attn) + self.KLDivLoss(pseudo_txt_attn.log(),
+                                                                                         txt_attn)
+        elif modal == 'V':
+            pseudo_img_attn = nn.Softmax(dim=-1)(txt_attn[rows, cols])
+            iais_loss = self.KLDivLoss(img_attn.log(), pseudo_img_attn) + self.KLDivLoss(pseudo_img_attn.log(),
+                                                                                         img_attn)
+        else:
+            raise ValueError('error modal')
+        return iais_loss
 
     def forward(self, hidden_states, attention_mask, head_mask=None,
-                encoder_history_states=None):
+                encoder_history_states=None, 
+                IAIS=False, txt_attn_mask=None, img_attn_mask=None):
         all_hidden_states = ()
         all_attentions = ()
         for i, layer_module in enumerate(self.layer):
@@ -106,6 +197,48 @@ class CaptionBertEncoder(BertEncoder):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             history_state = None if encoder_history_states is None else encoder_history_states[i]
+
+            ############################## IAIS ##############################
+            if IAIS and i == len(self.layer) - 1:  # compute IAIS L-singular loss for the last layer
+
+                max_tl = 70  # NOTE hard code here, should be args.max_seq_length
+                max_nbb = 70  # NOTE hard code here, should be args.max_img_seq_length
+
+                # prepare attention masks
+                extended_txt_attn_mask = self.extend_self_attn_mask(
+                                            txt_attn_mask)  # [sample_num, 1, max_attn_len, max_attn_len]
+                extended_img_attn_mask = self.extend_self_attn_mask(img_attn_mask)
+                extended_t2i_attn_mask, extended_i2t_attn_mask = self.extend_cross_attn_mask(txt_attn_mask, img_attn_mask)
+                txt_attn_mask, img_attn_mask, t2i_attn_mask, i2t_attn_mask = extended_txt_attn_mask, extended_img_attn_mask, extended_t2i_attn_mask, extended_i2t_attn_mask 
+
+                # extract attention matrice
+                gt_bs = hidden_states.size(0)//2 if self.training else hidden_states.size(0)
+                gt_indices = torch.tensor(list(range(0, gt_bs)),
+                                            dtype=torch.long, device=hidden_states.device)
+                hidden_states_gt = hidden_states.index_select(0, gt_indices)
+                txt_attn = self.get_attention_probs(layer_module, hidden_states_gt, txt_attn_mask, 1,
+                                                    max_tl - 2)  # remove [cls] and [sep]
+                img_attn = self.get_attention_probs(layer_module, hidden_states_gt, img_attn_mask, max_tl, max_nbb)
+                t2i_attn = self.get_attention_probs(layer_module, hidden_states_gt, t2i_attn_mask, 1, max_tl - 2,
+                                                    max_tl,
+                                                    max_nbb)  # [sample_num, max_tl-2, max_nbb]
+                i2t_attn = self.get_attention_probs(layer_module, hidden_states_gt, i2t_attn_mask, max_tl, max_nbb, 1,
+                                                    max_tl - 2)  # [sample_num, max_nbb, max_tl-2]
+
+                # compute IAIS loss (here I use the average of L-single and V-single losses)
+                self_attn_loss_layer_i = torch.tensor(0, dtype=hidden_states.dtype, device=hidden_states.device)
+                for j, (input_len, nbb) in enumerate(
+                        zip(txt_attn_mask[:, 0, 1, :].sum(1), img_attn_mask[:, 0, max_tl, :].sum(1))):
+                    input_len, nbb = int(input_len.item()), int(nbb.item())
+                    iais_loss_L = self.iais_singular(txt_attn[j, :input_len, :input_len], img_attn[j, :nbb, :nbb],
+                                                    t2i_attn[j, :input_len], input_len, 'L')
+                    iais_loss_V = self.iais_singular(txt_attn[j, :input_len, :input_len], img_attn[j, :nbb, :nbb],
+                                                    i2t_attn[j, :nbb], nbb, 'V')
+                    iais_loss = (iais_loss_L + iais_loss_V) / 2
+                    self_attn_loss_layer_i += iais_loss
+                self_attn_loss_layer_i = self_attn_loss_layer_i / gt_indices.size(0)
+            ##################################################################
+
             layer_outputs = layer_module(
                     hidden_states, attention_mask, head_mask[i],
                     history_state)
@@ -123,6 +256,8 @@ class CaptionBertEncoder(BertEncoder):
             outputs = outputs + (all_hidden_states,)
         if self.output_attentions:
             outputs = outputs + (all_attentions,)
+        if IAIS:
+            return outputs + (self_attn_loss_layer_i,)
         return outputs  # outputs, (hidden states), (attentions)
 
 
@@ -198,7 +333,8 @@ class BertImgModel(BertPreTrainedModel):
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
             position_ids=None, head_mask=None, img_feats=None,
-            encoder_history_states=None):
+            encoder_history_states=None, 
+            IAIS=False, txt_attn_mask=None, img_attn_mask=None):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
@@ -222,7 +358,8 @@ class BertImgModel(BertPreTrainedModel):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.to(dtype=torch.float32)
+        # extended_attention_mask = extended_attention_mask.to(dtype=next(self.module.parameters()).dtype) # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         # Prepare head mask if needed
@@ -270,7 +407,8 @@ class BertImgModel(BertPreTrainedModel):
 
         encoder_outputs = self.encoder(embedding_output,
                 extended_attention_mask, head_mask=head_mask,
-                encoder_history_states=encoder_history_states)
+                encoder_history_states=encoder_history_states, 
+                IAIS=IAIS, txt_attn_mask=txt_attn_mask, img_attn_mask=img_attn_mask)
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output)
 
@@ -323,9 +461,14 @@ class ImageBertForSequenceClassification(BertPreTrainedModel):
         self.bert.code_embeddings.weight.data = em.clone()
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, 
-            position_ids=None, head_mask=None, img_feats=None):
-        outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
-                            attention_mask=attention_mask, head_mask=head_mask, img_feats=img_feats)
+            position_ids=None, head_mask=None, img_feats=None, txt_attn_mask=None, img_attn_mask=None):
+        if self.loss_type == 'iais':
+            outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
+                                attention_mask=attention_mask, head_mask=head_mask, img_feats=img_feats, 
+                                IAIS=True, txt_attn_mask=txt_attn_mask, img_attn_mask=img_attn_mask)
+        else:
+            outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
+                                attention_mask=attention_mask, head_mask=head_mask, img_feats=img_feats)
         pooled_output = outputs[1]
 
         pooled_output = self.dropout(pooled_output)

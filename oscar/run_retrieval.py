@@ -19,6 +19,8 @@ from oscar.modeling.modeling_bert import ImageBertForSequenceClassification
 from transformers.pytorch_transformers import BertTokenizer, BertConfig 
 from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
 
+from oscar.utils.training_signal_annealing import get_tsa_threshold
+
 
 class RetrievalDataset(Dataset):
     """ Image/Text Retrieval Dataset"""
@@ -170,6 +172,24 @@ class RetrievalDataset(Dataset):
         if att_mask_type == "CLR":
             attention_mask = [1] * seq_len + [0] * seq_padding_len + \
                              [1] * img_len + [0] * img_padding_len
+            # txt_attn_mask and img_attn_mask for IAIS
+            txt_attn_mask = [0] + [1] * (seq_len-2) + [0] * (seq_padding_len+1) + \
+                             [0] * img_len + [0] * img_padding_len  # mask [CLS] and [SEP]
+            img_attn_mask = [0] * seq_len + [0] * seq_padding_len + \
+                             [1] * img_len + [0] * img_padding_len
+            
+            # txt_attn_mask[0] = 0  # mask [CLS]
+            # txt_attn_mask[-1] = 0  # mask [SEP]
+
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+            txt_attn_mask = torch.tensor(txt_attn_mask, dtype=torch.long)
+            img_attn_mask = torch.tensor(img_attn_mask, dtype=torch.long)
+            segment_ids = torch.tensor(segment_ids, dtype=torch.long)
+            if self.is_train:
+                return (input_ids, attention_mask, segment_ids, img_feat), (txt_attn_mask, img_attn_mask)
+            else:
+                return (input_ids, attention_mask, segment_ids, img_feat)
         else:
             # use 2D mask to represent the attention
             max_len = self.max_seq_len + self.max_img_seq_len
@@ -205,7 +225,7 @@ class RetrievalDataset(Dataset):
             feature = self.get_image(img_key)
             caption = self.captions[cap_idxs[0]][cap_idxs[1]]
             od_labels = self.get_od_labels(img_key)
-            example = self.tensorize_example(caption, feature, text_b=od_labels)
+            example, txt_img_attns = self.tensorize_example(caption, feature, text_b=od_labels)
 
             # select a negative pair
             neg_img_indexs = list(range(0, img_idx)) + list(range(img_idx + 1, len(self.img_keys)))
@@ -214,14 +234,14 @@ class RetrievalDataset(Dataset):
                 # randomly select a negative caption from a different image.
                 cap_idx_neg = random.randint(0, self.num_captions_per_img - 1)
                 caption_neg = self.captions[self.img_keys[img_idx_neg]][cap_idx_neg]
-                example_neg = self.tensorize_example(caption_neg, feature, text_b=od_labels)
+                example_neg, _ = self.tensorize_example(caption_neg, feature, text_b=od_labels)
             else:
                 # randomly select a negative image 
                 feature_neg = self.get_image(self.img_keys[img_idx_neg])
                 od_labels_neg = self.get_od_labels(self.img_keys[img_idx_neg])
-                example_neg = self.tensorize_example(caption, feature_neg, text_b=od_labels_neg)
+                example_neg, _ = self.tensorize_example(caption, feature_neg, text_b=od_labels_neg)
 
-            example_pair = tuple(list(example) + [1] + list(example_neg) + [0])
+            example_pair = tuple(list(example) + [1] + list(example_neg) + [0] + list(txt_img_attns))
             return index, example_pair
         else:
             img_idx, cap_idxs = self.get_image_caption_index(index)
@@ -239,7 +259,7 @@ class RetrievalDataset(Dataset):
         num_boxes = int(row[1])
         features = np.frombuffer(base64.b64decode(row[-1]),
                                  dtype=np.float32).reshape((num_boxes, -1))
-        t_features = torch.from_numpy(features)
+        t_features = torch.from_numpy(np.array(features, copy=True))
         return t_features
 
     def __len__(self):
@@ -370,10 +390,19 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
                 'attention_mask': torch.cat((batch[1], batch[6]), dim=0),
                 'token_type_ids': torch.cat((batch[2], batch[7]), dim=0),
                 'img_feats':      torch.cat((batch[3], batch[8]), dim=0),
-                'labels':         torch.cat((batch[4], batch[9]), dim=0)
+                'labels':         torch.cat((batch[4], batch[9]), dim=0),
+                'txt_attn_mask':  batch[10],
+                'img_attn_mask':  batch[11],
             }
             outputs = model(**inputs)
             loss, logits = outputs[:2]
+            if args.loss_type == 'iais':
+                self_attn_tsa_loss = outputs[-1]
+                self_attn_tsa_loss = self_attn_tsa_loss * get_tsa_threshold('exp_schedule',
+                                                                            global_step,
+                                                                            t_total,
+                                                                            )
+                loss = loss + self_attn_tsa_loss
             if args.n_gpu > 1: 
                 loss = loss.mean() # mean() to average on multi-gpu parallel training
             if args.gradient_accumulation_steps > 1:

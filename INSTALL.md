@@ -12,7 +12,7 @@ conda create --name oscar python=3.7
 conda activate oscar
 
 # install pytorch1.2
-conda install pytorch==1.7.1 torchvision==0.4.0 cudatoolkit=10.0 -c pytorch
+conda install pytorch==1.2.0 torchvision==0.4.0 cudatoolkit=10.0 -c pytorch
 
 export INSTALL_DIR=$PWD
 
@@ -34,5 +34,7 @@ python setup.py build develop
 pip install -r requirements.txt
 
 unset INSTALL_DIR
+
+pip install torch==1.7.1
 ```
 

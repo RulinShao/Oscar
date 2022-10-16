@@ -146,15 +146,15 @@ class CaptionBertEncoder(BertEncoder):
     def extend_self_attn_mask(self, attention_mask):
         '''note this attention is 0-1'''
         attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        attention_mask = attention_mask.to(dtype=next(self.parameters()).dtype)
+        attention_mask = attention_mask.to(dtype=torch.float32)
         attention_mask = torch.matmul(attention_mask.permute(0, 1, 3, 2), attention_mask)
         return attention_mask
 
     def extend_cross_attn_mask(self, txt_attn_mask, img_attn_mask):
         txt_attn_mask = txt_attn_mask.unsqueeze(1).unsqueeze(2)
-        txt_attn_mask = txt_attn_mask.to(dtype=next(self.parameters()).dtype)
+        txt_attn_mask = txt_attn_mask.to(dtype=torch.float32)
         img_attn_mask = img_attn_mask.unsqueeze(1).unsqueeze(2)
-        img_attn_mask = img_attn_mask.to(dtype=next(self.parameters()).dtype)
+        img_attn_mask = img_attn_mask.to(dtype=torch.float32)
         t2i_attn_mask = torch.matmul(txt_attn_mask.permute(0, 1, 3, 2), img_attn_mask)
         i2t_attn_mask = torch.matmul(img_attn_mask.permute(0, 1, 3, 2), txt_attn_mask)
         return t2i_attn_mask, i2t_attn_mask
@@ -374,7 +374,7 @@ class BertImgModel(BertPreTrainedModel):
             elif head_mask.dim() == 2:
                 head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)  # We can specify head_mask for each layer
             # switch to float if needed + fp16 compatibility
-            head_mask = head_mask.to(dtype=next(self.parameters()).dtype) # switch to fload if need + fp16 compatibility
+            head_mask = head_mask.to(dtype=torch.float32) # switch to fload if need + fp16 compatibility
         else:
             head_mask = [None] * self.config.num_hidden_layers
 

@@ -185,7 +185,7 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
 
         if input_ids is None:
             input_ids = torch.full(
-                (batch_size, 1), bos_token_id, dtype=torch.long, device=next(self.parameters()).device
+                (batch_size, 1), bos_token_id, dtype=torch.long, device=torch.float32
             )
         else:
             assert input_ids.dim() == 2, "Input prompt should be of shape (batch_size, sequence length)."

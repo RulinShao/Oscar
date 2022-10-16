@@ -17,5 +17,5 @@ python oscar/run_retrieval.py \
     --max_seq_length 70 \
     --max_img_seq_length 70 \
     --output_dir output/IAIS_COCO/ \
-    --loss_type iais
+    --loss_type iais &
     

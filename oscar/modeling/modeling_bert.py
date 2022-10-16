@@ -199,44 +199,47 @@ class CaptionBertEncoder(BertEncoder):
             history_state = None if encoder_history_states is None else encoder_history_states[i]
 
             ############################## IAIS ##############################
-            if IAIS and i == len(self.layer) - 1:  # compute IAIS L-singular loss for the last layer
-
-                max_tl = 70  # NOTE hard code here, should be args.max_seq_length
-                max_nbb = 70  # NOTE hard code here, should be args.max_img_seq_length
-
-                # prepare attention masks
-                extended_txt_attn_mask = self.extend_self_attn_mask(
-                                            txt_attn_mask)  # [sample_num, 1, max_attn_len, max_attn_len]
-                extended_img_attn_mask = self.extend_self_attn_mask(img_attn_mask)
-                extended_t2i_attn_mask, extended_i2t_attn_mask = self.extend_cross_attn_mask(txt_attn_mask, img_attn_mask)
-                txt_attn_mask, img_attn_mask, t2i_attn_mask, i2t_attn_mask = extended_txt_attn_mask, extended_img_attn_mask, extended_t2i_attn_mask, extended_i2t_attn_mask 
-
-                # extract attention matrice
-                gt_bs = hidden_states.size(0)//2 if self.training else hidden_states.size(0)
-                gt_indices = torch.tensor(list(range(0, gt_bs)),
-                                            dtype=torch.long, device=hidden_states.device)
-                hidden_states_gt = hidden_states.index_select(0, gt_indices)
-                txt_attn = self.get_attention_probs(layer_module, hidden_states_gt, txt_attn_mask, 1,
-                                                    max_tl - 2)  # remove [cls] and [sep]
-                img_attn = self.get_attention_probs(layer_module, hidden_states_gt, img_attn_mask, max_tl, max_nbb)
-                t2i_attn = self.get_attention_probs(layer_module, hidden_states_gt, t2i_attn_mask, 1, max_tl - 2,
-                                                    max_tl,
-                                                    max_nbb)  # [sample_num, max_tl-2, max_nbb]
-                i2t_attn = self.get_attention_probs(layer_module, hidden_states_gt, i2t_attn_mask, max_tl, max_nbb, 1,
-                                                    max_tl - 2)  # [sample_num, max_nbb, max_tl-2]
-
-                # compute IAIS loss (here I use the average of L-single and V-single losses)
+            if self.training and IAIS and i == len(self.layer) - 1:  # compute IAIS L-singular loss for the last layer
                 self_attn_loss_layer_i = torch.tensor(0, dtype=hidden_states.dtype, device=hidden_states.device)
-                for j, (input_len, nbb) in enumerate(
-                        zip(txt_attn_mask[:, 0, 1, :].sum(1), img_attn_mask[:, 0, max_tl, :].sum(1))):
-                    input_len, nbb = int(input_len.item()), int(nbb.item())
-                    iais_loss_L = self.iais_singular(txt_attn[j, :input_len, :input_len], img_attn[j, :nbb, :nbb],
-                                                    t2i_attn[j, :input_len], input_len, 'L')
-                    iais_loss_V = self.iais_singular(txt_attn[j, :input_len, :input_len], img_attn[j, :nbb, :nbb],
-                                                    i2t_attn[j, :nbb], nbb, 'V')
-                    iais_loss = (iais_loss_L + iais_loss_V) / 2
-                    self_attn_loss_layer_i += iais_loss
-                self_attn_loss_layer_i = self_attn_loss_layer_i / gt_indices.size(0)
+                try:
+
+                    max_tl = 70  # NOTE hard code here, should be args.max_seq_length
+                    max_nbb = 70  # NOTE hard code here, should be args.max_img_seq_length
+
+                    # prepare attention masks
+                    extended_txt_attn_mask = self.extend_self_attn_mask(
+                                                txt_attn_mask)  # [sample_num, 1, max_attn_len, max_attn_len]
+                    extended_img_attn_mask = self.extend_self_attn_mask(img_attn_mask)
+                    extended_t2i_attn_mask, extended_i2t_attn_mask = self.extend_cross_attn_mask(txt_attn_mask, img_attn_mask)
+                    txt_attn_mask, img_attn_mask, t2i_attn_mask, i2t_attn_mask = extended_txt_attn_mask, extended_img_attn_mask, extended_t2i_attn_mask, extended_i2t_attn_mask 
+
+                    # extract attention matrice
+                    gt_bs = hidden_states.size(0)//2
+                    gt_indices = torch.tensor(list(range(0, gt_bs)),
+                                                dtype=torch.long, device=hidden_states.device)
+                    hidden_states_gt = hidden_states.index_select(0, gt_indices)
+                    txt_attn = self.get_attention_probs(layer_module, hidden_states_gt, txt_attn_mask, 1,
+                                                        max_tl - 2)  # remove [cls] and [sep]
+                    img_attn = self.get_attention_probs(layer_module, hidden_states_gt, img_attn_mask, max_tl, max_nbb)
+                    t2i_attn = self.get_attention_probs(layer_module, hidden_states_gt, t2i_attn_mask, 1, max_tl - 2,
+                                                        max_tl,
+                                                        max_nbb)  # [sample_num, max_tl-2, max_nbb]
+                    i2t_attn = self.get_attention_probs(layer_module, hidden_states_gt, i2t_attn_mask, max_tl, max_nbb, 1,
+                                                        max_tl - 2)  # [sample_num, max_nbb, max_tl-2]
+
+                    # compute IAIS loss (here I use the average of L-single and V-single losses)
+                    for j, (input_len, nbb) in enumerate(
+                            zip(txt_attn_mask[:, 0, 1, :].sum(1), img_attn_mask[:, 0, max_tl, :].sum(1))):
+                        input_len, nbb = int(input_len.item()), int(nbb.item())
+                        iais_loss_L = self.iais_singular(txt_attn[j, :input_len, :input_len], img_attn[j, :nbb, :nbb],
+                                                        t2i_attn[j, :input_len], input_len, 'L')
+                        iais_loss_V = self.iais_singular(txt_attn[j, :input_len, :input_len], img_attn[j, :nbb, :nbb],
+                                                        i2t_attn[j, :nbb], nbb, 'V')
+                        iais_loss = (iais_loss_L + iais_loss_V) / 2
+                        self_attn_loss_layer_i += iais_loss
+                    self_attn_loss_layer_i = self_attn_loss_layer_i / gt_indices.size(0)
+                except:
+                    print("An exception occurred! Failed to compute IAIS loss for one batch!")
             ##################################################################
 
             layer_outputs = layer_module(

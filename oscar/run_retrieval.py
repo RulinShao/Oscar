@@ -337,7 +337,7 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) 
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
-            batch_size=args.train_batch_size, num_workers=args.num_workers)
+            batch_size=args.train_batch_size, num_workers=args.num_workers, drop_last=True)  # raise error in the last batch
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -383,6 +383,11 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
     best_score = 0
     for epoch in range(int(args.num_train_epochs)):
         for step, (_, batch) in enumerate(train_dataloader):
+            # print(len(train_dataloader))
+            # if step < 4400:
+            #     print(f"skipping {step}")
+            #     continue
+            
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {

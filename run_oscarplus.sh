@@ -1,4 +1,4 @@
-python oscar/run_retrieval.py \
+nohup python oscar/run_retrieval.py \
     --model_name_or_path /home/ubuntu/checkpoints/Oscar/checkpoint-1340000 \
     --data_dir /home/ubuntu/data/coco_ir \
     --img_feat_file /home/ubuntu/data/vinvl_coco14_train_val/model_0060000/features.tsv \
